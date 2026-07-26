@@ -6653,17 +6653,21 @@ api.get('/grns/:id', authorizeAction('grn', 'view'), async (req, res) => {
   const { id } = req.params;
   try {
     const [grnRows]: any = await pool.execute(`
-      SELECT 
-        g.*, 
+      SELECT
+        g.*,
         p.name as projectName,
+        po.po_number,
+        po.po_status,
+        po.procurement_type,
         vi.invoice_number,
         vi.status as invoice_status,
         vi.updatedAt as finalized_at,
         COALESCE(gi_sum.confirmed_subtotal, g.total_amount) as confirmed_total_amount,
         COALESCE(gi_sum.estimated_subtotal, g.total_amount) as estimated_total_amount,
         COALESCE(gi_sum.grn_variance, 0) as grn_variance
-      FROM grns g 
-      LEFT JOIN projects p ON g.projectId = p.id 
+      FROM grns g
+      LEFT JOIN projects p ON g.projectId = p.id
+      LEFT JOIN purchase_orders po ON g.po_id = po.id
       LEFT JOIN (
         SELECT 
           gi.grn_id, 
@@ -7056,6 +7060,51 @@ async function logStatusHistory(
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [entityType, entityId, oldStatus, newStatus, user?.userId || null, user?.name || user?.email || 'System', remarks || '']
   );
+}
+
+/**
+ * Single source of truth for deriving and persisting a Purchase Order's status from its
+ * current (already-reconciled) procurement_items ledger. Used after any receipt-quantity change.
+ *
+ * Status rule (identical to the logic historically inlined in GRN post/cancel):
+ *   - nothing received (received <= 0)        -> SENT_TO_VENDOR
+ *   - fully received   (remaining <= 0.01)    -> CLOSED
+ *   - partially received                      -> SENT_TO_VENDOR
+ *
+ * Persists the new status and writes the procurement audit + status-history trail.
+ * MUST run inside an open transaction; performs no commit/rollback of its own.
+ * Returns the newly persisted status.
+ */
+async function recalculatePoStatus(
+  connection: mysql.PoolConnection | mysql.Pool,
+  poId: number,
+  user: any,
+  actionType: string,
+  remarks: string
+): Promise<string> {
+  const [remainingItems]: any = await connection.execute(
+    `SELECT SUM(quantity - COALESCE(received_quantity, 0)) AS remaining FROM procurement_items WHERE parent_type = 'PO' AND parent_id = ?`,
+    [poId]
+  );
+  const [receivedCount]: any = await connection.execute(
+    `SELECT SUM(COALESCE(received_quantity, 0)) AS received FROM procurement_items WHERE parent_type = 'PO' AND parent_id = ?`,
+    [poId]
+  );
+  const [poStatusRows]: any = await connection.execute(
+    'SELECT po_status FROM purchase_orders WHERE id = ?',
+    [poId]
+  );
+  const oldStatus = poStatusRows[0]?.po_status || null;
+
+  let newStatus: string = PO_STATUS.SENT_TO_VENDOR;
+  if (parseFloat(receivedCount[0].received || 0) > 0) {
+    newStatus = parseFloat(remainingItems[0].remaining || 0) <= 0.01 ? PO_STATUS.CLOSED : PO_STATUS.SENT_TO_VENDOR;
+  }
+
+  await connection.execute('UPDATE purchase_orders SET po_status = ? WHERE id = ?', [newStatus, poId]);
+  await logProcurementAction(connection, 'PO', poId, actionType, user, remarks);
+  await logStatusHistory(connection, 'PO', poId, oldStatus, newStatus, user, remarks);
+  return newStatus;
 }
 
 export async function logErpActivity(
@@ -8645,7 +8694,7 @@ api.put('/grns/:id', authorizeAction('grn', 'edit'), async (req, res) => {
       [id]
     );
     if (oldGrnRows.length === 0) throw new Error('GRN not found');
-    if (oldGrnRows[0].status !== 'ACTIVE') throw new Error('Only ACTIVE GRNs can be edited');
+    if (![GRN_STATUS.ACTIVE, GRN_STATUS.POSTED].includes(oldGrnRows[0].status)) throw new Error('Only ACTIVE GRNs can be edited');
 
     const oldGrn = oldGrnRows[0];
     const grnNumber = oldGrn.grn_number;
@@ -8693,6 +8742,22 @@ api.put('/grns/:id', authorizeAction('grn', 'edit'), async (req, res) => {
       // 🚀 FULL REVERSAL MODE
       await connection.execute('UPDATE inventory_batches SET is_void = TRUE WHERE grn_id = ?', [id]);
       await connection.execute('UPDATE material_issues SET is_deleted = TRUE WHERE grn_id = ?', [id]);
+
+      // 🛡️ PROCUREMENT RECONCILIATION — STEP 2: REVERSE original received quantities from the PO ledger.
+      // Only applies to PO-linked GRNs. Uses the pre-edit item snapshot captured above (oldItemsForSnapshot),
+      // since grn_items rows are about to be deleted and re-inserted below.
+      // GREATEST(0, ...) guarantees received_quantity can never become negative even on pre-existing drift.
+      const reconcilePoId = oldGrn.po_id;
+      if (reconcilePoId) {
+        for (const oldItem of oldItemsForSnapshot) {
+          await connection.execute(
+            `UPDATE procurement_items
+             SET received_quantity = GREATEST(0, COALESCE(received_quantity, 0) - ?)
+             WHERE parent_type = 'PO' AND parent_id = ? AND inventory_id = ?`,
+            [oldItem.quantity, reconcilePoId, oldItem.inventory_id]
+          );
+        }
+      }
 
       const totalAmount = items.reduce((acc: number, item: any) => acc + (parseFloat(item.totalAmount) || (parseFloat(item.quantity) * parseFloat(item.rate)) || 0), 0);
       const discAmt = (discountType === 'PERCENTAGE') ? (totalAmount * (parseFloat(discountValue) || 0) / 100) : (parseFloat(discountValue) || 0);
@@ -8765,6 +8830,45 @@ api.put('/grns/:id', authorizeAction('grn', 'edit'), async (req, res) => {
             [item.inventory_id, id, grnNumber, qty, qty, itemTotal, itemTotal, highPrecisionRate, grn_date]
           );
         }
+      }
+
+      // 🛡️ PROCUREMENT RECONCILIATION — STEP 6: APPLY the new received quantities back into the PO ledger.
+      // Validates the ordered-quantity ceiling before writing so received_quantity can never exceed what was ordered.
+      if (reconcilePoId) {
+        for (const item of items) {
+          const newQty = parseFloat(item.quantity) || 0;
+          const [poItemRows]: any = await connection.execute(
+            `SELECT quantity, COALESCE(received_quantity, 0) AS received_quantity
+             FROM procurement_items
+             WHERE parent_type = 'PO' AND parent_id = ? AND inventory_id = ?`,
+            [reconcilePoId, item.inventory_id]
+          );
+          if (poItemRows.length === 0) {
+            throw new Error(`Item ${item.item_name} is not part of the linked Purchase Order and cannot be added during edit.`);
+          }
+          const ordered = parseFloat(poItemRows[0].quantity);
+          const currentReceived = parseFloat(poItemRows[0].received_quantity);
+          if (currentReceived + newQty > ordered + 0.01) { // Small tolerance for rounding
+            const pending = ordered - currentReceived;
+            throw new Error(`Quantity exceeds PO limit for ${item.item_name}. Pending: ${pending.toFixed(2)}`);
+          }
+          await connection.execute(
+            `UPDATE procurement_items
+             SET received_quantity = COALESCE(received_quantity, 0) + ?
+             WHERE parent_type = 'PO' AND parent_id = ? AND inventory_id = ?`,
+            [newQty, reconcilePoId, item.inventory_id]
+          );
+        }
+
+        // 🛡️ PROCUREMENT RECONCILIATION — STEPS 7 & 8: Recompute procurement + Purchase Order status from
+        // the reconciled ledger via the shared helper (single source of truth — no duplicated status logic).
+        await recalculatePoStatus(
+          connection,
+          reconcilePoId,
+          (req as any).user,
+          'GRN_EDITED',
+          `GRN ${grnNumber} edited (procurement quantities reconciled)`
+        );
       }
 
       for (const invId of affectedInvIds) {

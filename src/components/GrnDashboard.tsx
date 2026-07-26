@@ -347,6 +347,8 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
   const [isEmergency, setIsEmergency] = useState(false);
   const [emergencyReason, setEmergencyReason] = useState('');
   const [purchaseOrders, setPurchaseOrders] = useState<any[]>([]);
+  // Read-only linked-PO details for Edit mode (hydrated from GET /grns/:id). Immutable historical data.
+  const [editPoMeta, setEditPoMeta] = useState<{ po_number?: string; po_status?: string; procurement_type?: string } | null>(null);
 
   // Master Data
   const [masterVendors, setMasterVendors] = useState<any[]>([]);
@@ -630,9 +632,12 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
     setPoId('');
     setIsEmergency(false);
     setEmergencyReason('');
+    setEditPoMeta(null);
   };
 
   const handleEditClick = (grn: any) => {
+    // Reset stale create/edit state before loading this GRN's historical values.
+    resetForm();
     setIsEditMode(true);
     setEditingGrnId(grn.id);
     setVendorName(grn.vendorName || '');
@@ -641,8 +646,13 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
     setGrnDate(grn.grn_date.split('T')[0]);
     setRemarks(grn.remarks || '');
     setDestinationType(grn.destination_type || 'CENTRAL_STORE');
-    
-    // Fetch full details to get items
+
+    // 🛡️ Hydrate Procurement Authorization state from the existing GRN (immutable historical data).
+    setPoId(grn.po_id ? String(grn.po_id) : '');
+    setIsEmergency(!!grn.is_emergency);
+    setEmergencyReason(grn.emergency_reason || '');
+
+    // Fetch full details to get items + PO metadata (po_number / po_status / procurement_type).
     handleFetchAndSetItems(grn.id);
     setIsModalOpen(true);
   };
@@ -655,6 +665,15 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
       if (res.ok) {
         const data = await res.json();
         setIsUsedForEdit(data.is_used || false);
+        // 🛡️ Hydrate immutable Procurement Authorization details from the authoritative GRN record.
+        setPoId(data.po_id ? String(data.po_id) : '');
+        setIsEmergency(!!data.is_emergency);
+        setEmergencyReason(data.emergency_reason || '');
+        setEditPoMeta(data.po_id ? {
+          po_number: data.po_number,
+          po_status: data.po_status,
+          procurement_type: data.procurement_type
+        } : null);
         setItems(data.items.map((it: any) => ({
           inventory_id: it.inventory_id,
           item_name: it.item_name,
@@ -1012,11 +1031,12 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
                   </div>
                   
                   {hasPermission('grn', 'view') && (
-                    <label className="flex items-center cursor-pointer group">
-                      <input 
-                        type="checkbox" 
+                    <label className={`flex items-center group ${isEditMode ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}>
+                      <input
+                        type="checkbox"
                         className="sr-only peer"
                         checked={isEmergency}
+                        disabled={isEditMode}
                         onChange={(e) => {
                           setIsEmergency(e.target.checked);
                           if (e.target.checked) setPoId('');
@@ -1028,7 +1048,51 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
                   )}
                 </div>
 
-                {!isEmergency ? (
+                {isEditMode ? (
+                  isEmergency ? (
+                    /* 🛡️ EDIT MODE — Read-only Emergency Manual GRN (immutable historical authorization) */
+                    <div className="md:col-span-2 space-y-1.5">
+                      <label className="block text-[10px] font-black text-rose-600 uppercase tracking-wider ml-1 flex items-center">
+                        <ShieldAlert className="w-3 h-3 mr-1.5" />
+                        Emergency Manual GRN
+                      </label>
+                      <div className="w-full px-4 py-3 bg-rose-50 border border-rose-200 rounded-xl">
+                        <div className="flex items-center text-[10px] font-black text-rose-600 uppercase tracking-widest mb-1">
+                          <Lock className="w-3 h-3 mr-1.5" /> Emergency Authorization (Locked)
+                        </div>
+                        <p className="text-sm font-bold text-slate-800 whitespace-pre-wrap">{emergencyReason || 'No emergency reason recorded.'}</p>
+                        <p className="text-[10px] text-rose-500 font-semibold mt-2">This GRN was created without a Purchase Order and cannot be changed.</p>
+                      </div>
+                    </div>
+                  ) : (
+                    /* 🛡️ EDIT MODE — Read-only Procurement Authorization card (linked PO is immutable) */
+                    <div className="md:col-span-2 space-y-1.5">
+                      <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider ml-1">Linked Purchase Order (PO)</label>
+                      <div className="w-full px-4 py-3 bg-white border border-blue-200 rounded-xl">
+                        <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+                          <div>
+                            <span className="block text-[9px] font-black text-slate-400 uppercase tracking-wider">PO Number</span>
+                            <span className="text-sm font-black text-blue-700">{editPoMeta?.po_number || '—'}</span>
+                          </div>
+                          <div>
+                            <span className="block text-[9px] font-black text-slate-400 uppercase tracking-wider">PO Status</span>
+                            <span className="px-2 py-0.5 inline-block bg-slate-100 text-slate-700 text-[10px] font-black rounded uppercase">{editPoMeta?.po_status || 'N/A'}</span>
+                          </div>
+                          {editPoMeta?.procurement_type && (
+                            <div>
+                              <span className="block text-[9px] font-black text-slate-400 uppercase tracking-wider">Procurement Type</span>
+                              <span className="text-sm font-bold text-slate-800">{editPoMeta.procurement_type}</span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex items-center text-[10px] text-slate-500 font-semibold mt-3 pt-2 border-t border-slate-100">
+                          <Lock className="w-3 h-3 mr-1.5 text-slate-400" />
+                          This Purchase Order was used to create this GRN and cannot be changed.
+                        </div>
+                      </div>
+                    </div>
+                  )
+                ) : !isEmergency ? (
                   <div className="md:col-span-2 space-y-1.5">
                     <label className="block text-[10px] font-black text-slate-500 uppercase tracking-wider ml-1">Link Purchase Order (PO)</label>
                     <select 
