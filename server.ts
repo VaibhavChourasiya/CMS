@@ -8914,6 +8914,23 @@ api.put('/grns/:id', authorizeAction('grn', 'edit'), async (req, res) => {
       throw new Error(`Critical Governance Error: Audit trail could not be persisted. Reason: ${auditErr.message}. The transaction has been aborted.`);
     }
 
+    await logErpActivity(connection, {
+      actor: (req as any).user as Session,
+      module: 'grn',
+      action: 'UPDATE',
+      entityType: 'GRN',
+      entityId: Number(id),
+      projectId: (isUsed ? oldGrn.projectId : projectId) || null,
+      vendorId: resolvedVendorId || oldGrn.vendor_id || null,
+      targetUrl: `/grn?id=${id}`,
+      details: {
+        recordNumber: grnNumber,
+        vendorName: vendorName || oldGrn.vendorName,
+        amount: finalAmtSnapshot,
+        remarks: edit_reason || 'GRN edited'
+      }
+    });
+
     console.log('⚖️ [AUDIT_TRACE] All checks passed. Committing transaction...');
     await connection.commit();
     console.log('🏁 [AUDIT_TRACE] GRN Edit + Audit Trail persisted atomically.');
