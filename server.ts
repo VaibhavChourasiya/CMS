@@ -4678,6 +4678,28 @@ api.post('/inventory/vouchers/revert/:id', authorizeAction('inventory', 'rollbac
       await syncInventoryFromBatches(connection, invId);
     }
 
+    // 6. Reuse the existing audit mechanism (no new logging implementation).
+    const [projRows]: any = await connection.execute(
+      'SELECT name FROM projects WHERE id = ?',
+      [voucher.project_id]
+    );
+
+    await logErpActivity(connection, {
+      actor: session,
+      module: 'inventory',
+      action: 'REVERT',
+      entityType: 'MATERIAL_ISSUE_VOUCHER',
+      entityId: Number(id),
+      projectId: voucher.project_id || null,
+      targetUrl: `/inventory?voucher_id=${id}`,
+      details: {
+        recordNumber: voucher.voucher_no,
+        projectName: projRows[0]?.name,
+        amount: parseFloat(voucher.total_valuation || '0'),
+        remarks: `Voucher fully reverted. Issued to: ${voucher.issued_to}. Items restored: ${items.length}. Reason: ${String(reason).trim()}`
+      }
+    });
+
     await connection.commit();
     res.status(200).json({ message: 'Entire voucher reverted successfully' });
   } catch (error: any) {
