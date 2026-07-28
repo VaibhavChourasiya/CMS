@@ -4669,7 +4669,7 @@ api.post('/inventory/vouchers/revert/:id', authorizeAction('inventory', 'rollbac
 
     // 4. Mark Voucher as Fully Reverted
     await connection.execute(
-      'UPDATE material_issue_vouchers SET status = "FULLY_REVERTED", remarks = CONCAT(COALESCE(remarks, ""), " | REVERTED: ", ?) WHERE id = ?',
+      `UPDATE material_issue_vouchers SET status = 'FULLY_REVERTED', remarks = CONCAT(COALESCE(remarks, ''), ' | REVERTED: ', ?) WHERE id = ?`,
       [reason, id]
     );
 
