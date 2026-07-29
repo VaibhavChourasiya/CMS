@@ -4598,6 +4598,23 @@ api.post('/inventory/voucher', authorizeAction('inventory', 'create'), async (re
       await syncInventoryFromBatches(connection, invId);
     }
 
+    // 7. Reuse the existing audit mechanism (no new logging implementation).
+    await logErpActivity(connection, {
+      actor: session,
+      module: 'inventory',
+      action: 'CREATE',
+      entityType: 'MATERIAL_ISSUE_VOUCHER',
+      entityId: voucherId,
+      projectId: project_id,
+      targetUrl: `/inventory?voucher_id=${voucherId}`,
+      details: {
+        recordNumber: voucherNo,
+        projectName,
+        amount: grandTotalValuation,
+        remarks: `Material Issue Voucher created. Issued To: ${issued_to}. Requested Items: ${items.length}.${purpose ? ` Purpose: ${purpose}.` : ''}${remarks ? ` Remarks: ${remarks}.` : ''}`
+      }
+    });
+
     await connection.commit();
     res.status(200).json({ message: 'Voucher issued successfully', voucher_no: voucherNo });
   } catch (error: any) {
