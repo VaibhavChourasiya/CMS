@@ -10190,7 +10190,7 @@ api.get('/reports/material-consumption', authorizeAction('reports', 'view'), asy
       JOIN material_issue_vouchers miv ON mii.voucher_id = miv.id
       JOIN projects p ON miv.project_id = p.id
       JOIN inventory inv ON mii.inventory_id = inv.id
-      WHERE mii.is_deleted = FALSE AND mii.revert_status = "ACTIVE"
+      WHERE mii.is_deleted = FALSE AND mii.revert_status = 'ACTIVE'
     `;
     const params: any[] = [];
 
@@ -10205,6 +10205,15 @@ api.get('/reports/material-consumption', authorizeAction('reports', 'view'), asy
     const [rows] = await pool.execute(query, params);
     res.status(200).json(rows);
   } catch (error: any) {
+    console.error("Material Consumption Report Error:", {
+      message: error.message,
+      code: error.code,
+      errno: error.errno,
+      sqlState: error.sqlState,
+      sqlMessage: error.sqlMessage,
+      sql: error.sql,
+      stack: error.stack
+    });
     res.status(500).json({ error: error.message });
   }
 });
@@ -10218,9 +10227,12 @@ api.get('/reports/project-consumption', authorizeAction('reports', 'view'), asyn
 
   try {
     let query = `
-      SELECT 
+      SELECT
         p.name as project_name,
-        mii.item_name,
+        -- Rows are grouped by mii.inventory_id, so the item name is read from the
+        -- inventory master (functionally dependent on the group key via inv.id),
+        -- not from the per-line snapshot which is not. Same basis as inv.unit below.
+        inv.item_name as item_name,
         SUM(mii.quantity) as total_qty,
         SUM(mii.total_cost) as total_fifo_cost,
         MAX(miv.issue_date) as last_consumption_date,
@@ -10229,7 +10241,7 @@ api.get('/reports/project-consumption', authorizeAction('reports', 'view'), asyn
       JOIN material_issue_vouchers miv ON mii.voucher_id = miv.id
       JOIN projects p ON miv.project_id = p.id
       JOIN inventory inv ON mii.inventory_id = inv.id
-      WHERE mii.is_deleted = FALSE AND mii.revert_status = "ACTIVE"
+      WHERE mii.is_deleted = FALSE AND mii.revert_status = 'ACTIVE'
     `;
     const params: any[] = [];
 
@@ -10242,6 +10254,15 @@ api.get('/reports/project-consumption', authorizeAction('reports', 'view'), asyn
     const [rows] = await pool.execute(query, params);
     res.status(200).json(rows);
   } catch (error: any) {
+    console.error("Project Consumption Report Error:", {
+      message: error.message,
+      code: error.code,
+      errno: error.errno,
+      sqlState: error.sqlState,
+      sqlMessage: error.sqlMessage,
+      sql: error.sql,
+      stack: error.stack
+    });
     res.status(500).json({ error: error.message });
   }
 });

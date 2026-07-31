@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Package, Download, Search, Info } from 'lucide-react';
+import { Package, Download, Search, Info, AlertTriangle } from 'lucide-react';
 import { API_CONFIG } from '../../config';
 import { getAuthToken } from '../../services/api';
 
@@ -10,10 +10,12 @@ interface MaterialConsumptionReportProps {
 export function MaterialConsumptionReport({ filters }: MaterialConsumptionReportProps) {
   const [data, setData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
       setLoading(true);
+      setError(null);
       try {
         const token = getAuthToken();
         const queryParams = new URLSearchParams({
@@ -24,13 +26,43 @@ export function MaterialConsumptionReport({ filters }: MaterialConsumptionReport
           grn_no: filters.grn_no
         });
 
-        const response = await fetch(`${API_CONFIG.BASE_URL}/reports/material-consumption?${queryParams}`, {
-          headers: { 'Authorization': `Bearer ${token}` }
-        });
-        const resData = await response.json();
-        setData(Array.isArray(resData) ? resData : []);
-      } catch (err) {
-        console.error(err);
+        let response: Response;
+        try {
+          response = await fetch(`${API_CONFIG.BASE_URL}/reports/material-consumption?${queryParams}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+        } catch {
+          // fetch() rejects only on network-level failure (offline, DNS, connection refused).
+          throw new Error('Unable to reach the server. Please check your connection and try again.');
+        }
+
+        // Surface HTTP failures instead of letting them fall through as an empty report.
+        if (!response.ok) {
+          let message = `Report request failed (HTTP ${response.status}).`;
+          try {
+            const errBody = await response.json();
+            if (errBody?.error) message = errBody.error;
+          } catch {
+            // Non-JSON error body (proxy/gateway HTML) — keep the status-based message.
+          }
+          throw new Error(message);
+        }
+
+        let resData: any;
+        try {
+          resData = await response.json();
+        } catch {
+          throw new Error('Unexpected response format received from the server.');
+        }
+        if (!Array.isArray(resData)) {
+          throw new Error('Unexpected response format received from the server.');
+        }
+        setData(resData);
+      } catch (err: any) {
+        console.error('Material Consumption Report failed to load:', err);
+        // Clear stale rows so a failure can never be read as current data.
+        setData([]);
+        setError(err?.message || 'Unable to load the Material Consumption report.');
       } finally {
         setLoading(false);
       }
@@ -135,7 +167,21 @@ export function MaterialConsumptionReport({ filters }: MaterialConsumptionReport
                 <td className="py-4 text-sm font-black text-emerald-600 text-right">₹{parseFloat(row.fifo_cost).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
               </tr>
             ))}
-            {!loading && data.length === 0 && (
+            {!loading && error && (
+              <tr>
+                <td colSpan={5} className="py-10 text-center">
+                  <div className="inline-flex items-start max-w-xl px-4 py-3 bg-rose-50 border border-rose-100 rounded-xl text-left">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 mt-0.5 mr-3 flex-shrink-0" />
+                    <div>
+                      <div className="text-[10px] font-black text-rose-700 uppercase tracking-widest">Report failed to load</div>
+                      <div className="text-xs font-medium text-rose-600 mt-1 break-words">{error}</div>
+                      <div className="text-[10px] font-bold text-rose-400 uppercase tracking-widest mt-2">This is an error, not an empty result. Figures shown elsewhere may be incomplete.</div>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            )}
+            {!loading && !error && data.length === 0 && (
               <tr><td colSpan={5} className="py-10 text-center text-slate-400 text-sm font-medium">No consumption records found for selected period.</td></tr>
             )}
           </tbody>
