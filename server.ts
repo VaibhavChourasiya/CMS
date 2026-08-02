@@ -906,9 +906,11 @@ async function initDB() {
       console.log(`🛡️ Seeding Root CEO: ${ROOT_CEO_EMAIL}`);
       const rootUid = crypto.randomBytes(16).toString('hex');
       const rootHash = hashPassword(ROOT_CEO_PASSWORD);
+      // backdate_limit -1 = unlimited. Seeded here because checkRootProtection blocks
+      // the Root CEO from being edited via User Management, so this is the only place it can be set.
       await poolConnection.query(
-        'INSERT INTO users (uid, name, email, password_hash, role, status, mustChangePwd) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [rootUid, 'Root CEO', ROOT_CEO_EMAIL, rootHash, ROLES.CEO, 'Active', true]
+        'INSERT INTO users (uid, name, email, password_hash, role, status, mustChangePwd, backdate_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [rootUid, 'Root CEO', ROOT_CEO_EMAIL, rootHash, ROLES.CEO, 'Active', true, -1]
       );
     } else {
       console.log(`✅ Root CEO already exists, updating role, status, and password hash from env`);
