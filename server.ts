@@ -9883,31 +9883,109 @@ api.post('/vendor-invoices/:id/finalize', authorizeAction('vendor_invoices', 'ap
   }
 });
 
+/**
+ * Permanent deletion of a Vendor Invoice that has only been through "Save & Link GRNs".
+ *
+ * An invoice in that state is temporary working data, not an official financial document:
+ * it has never been confirmed, never been finalized, has not moved inventory and cannot
+ * carry a payment (payments require FINALIZED — see POST /vendor-payments). Deleting it
+ * therefore removes it outright rather than soft-deleting it, so every linked GRN is
+ * released back to the available pool immediately and can be re-invoiced.
+ *
+ * Children are removed before the header inside one transaction. The FKs on
+ * vendor_invoice_items and vendor_invoice_grns are ON DELETE CASCADE, so the header
+ * delete alone would suffice — the explicit statements keep the intent readable and keep
+ * the release of the GRN independent of the cascade configuration.
+ */
 api.delete('/vendor-invoices/:id', authorizeAction('vendor_invoices', 'delete'), async (req, res) => {
   const { id } = req.params;
+  const connection = await pool.getConnection();
   try {
-    const [rows]: any = await pool.execute(
-      'SELECT status FROM vendor_invoices WHERE id = ? AND is_deleted = FALSE',
+    await connection.beginTransaction();
+
+    const [rows]: any = await connection.execute(
+      `SELECT id, invoice_number, status, vendor_id, vendor_name_snapshot, invoice_amount
+       FROM vendor_invoices WHERE id = ? AND is_deleted = FALSE FOR UPDATE`,
       [id]
     );
     if (rows.length === 0) {
-      return res.status(404).json({ error: 'Invoice not found' });
+      throw new AppError('NOT_FOUND', 'Invoice not found', 404);
     }
-    if (rows[0].status !== 'DRAFT') {
-      return res.status(400).json({ error: 'Only invoices in DRAFT status can be deleted.' });
+    const invoice = rows[0];
+    if (invoice.status !== 'DRAFT') {
+      throw new AppError(
+        'BUSINESS_RULE_ERROR',
+        'This invoice has already been confirmed and can no longer be deleted.',
+        400
+      );
     }
 
-    const [result]: any = await pool.execute(
-      'UPDATE vendor_invoices SET is_deleted = TRUE WHERE id = ?',
+    // Capture the GRNs being released before the link rows are removed
+    const [grnLinks]: any = await connection.execute(
+      `SELECT vig.grn_id, g.grn_number, g.projectId
+       FROM vendor_invoice_grns vig
+       LEFT JOIN grns g ON g.id = vig.grn_id
+       WHERE vig.vendor_invoice_id = ?`,
       [id]
     );
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Invoice not found' });
+    const releasedGrns = grnLinks.map((l: any) => l.grn_number || `GRN #${l.grn_id}`);
+    const invoiceProjectId = grnLinks.find((l: any) => l.projectId)?.projectId || null;
+
+    // 1. Line items
+    const [itemsResult]: any = await connection.execute(
+      'DELETE FROM vendor_invoice_items WHERE vendor_invoice_id = ?',
+      [id]
+    );
+    // 2. GRN links — releases each GRN's unique_grn_link slot
+    const [linksResult]: any = await connection.execute(
+      'DELETE FROM vendor_invoice_grns WHERE vendor_invoice_id = ?',
+      [id]
+    );
+    // 3. Invoice header
+    const [headerResult]: any = await connection.execute(
+      'DELETE FROM vendor_invoices WHERE id = ?',
+      [id]
+    );
+    if (headerResult.affectedRows === 0) {
+      throw new AppError('NOT_FOUND', 'Invoice not found', 404);
     }
-    res.status(200).json({ message: 'Vendor Invoice deleted successfully' });
+
+    const user = (req as any).user as Session;
+    await logErpActivity(connection, {
+      actor: user,
+      module: 'vendor_invoices',
+      action: 'DELETE',
+      entityType: 'INVOICE',
+      entityId: Number(id),
+      projectId: invoiceProjectId,
+      vendorId: invoice.vendor_id,
+      targetUrl: `/vendor-invoices`,
+      details: {
+        recordNumber: invoice.invoice_number,
+        vendorName: invoice.vendor_name_snapshot,
+        amount: parseFloat(invoice.invoice_amount),
+        remarks: releasedGrns.length
+          ? `Invoice permanently deleted. GRNs released: ${releasedGrns.join(', ')}`
+          : 'Invoice permanently deleted.'
+      }
+    });
+
+    await connection.commit();
+    res.status(200).json({
+      message: 'Vendor Invoice deleted successfully',
+      deleted: {
+        invoice_items: itemsResult.affectedRows,
+        grn_links: linksResult.affectedRows,
+        invoice: headerResult.affectedRows
+      },
+      released_grns: releasedGrns
+    });
   } catch (error: any) {
+    if (connection) await connection.rollback();
     console.error('Error deleting vendor invoice:', error);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
