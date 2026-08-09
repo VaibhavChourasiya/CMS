@@ -4923,6 +4923,61 @@ api.get('/inventory', authorizeAction('inventory', 'view'), async (req, res) => 
   }
 });
 
+/**
+ * Last Vendor Invoice Rate per inventory item — read-only reference data for item selectors.
+ *
+ * The rate comes from vendor_invoice_items.confirmed_rate, the only record of what a vendor
+ * actually billed. That column is seeded with the GRN estimated rate when an invoice is first
+ * saved as DRAFT, and only becomes meaningful once the invoice reaches CONFIRMED — at which
+ * point PUT /vendor-invoices/:id refuses further edits and the rate is frozen. The status
+ * filter below is therefore what makes the value trustworthy: without it this endpoint would
+ * hand back GRN estimates wearing the name "confirmed_rate".
+ *
+ * Inventory is reached transitively — vendor_invoice_items -> grn_items -> inventory — because
+ * no column links an invoice line directly to an inventory item.
+ *
+ * A single window-function pass ranks each item's invoice history and keeps only the newest
+ * row per item, so the cost is one query regardless of how many items the selector holds.
+ */
+api.get('/inventory/last-invoice-rates', authorizeAction('inventory', 'view'), async (_req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT
+        ranked.inventory_id,
+        ranked.confirmed_rate AS last_invoice_rate,
+        ranked.invoice_id,
+        ranked.invoice_number,
+        ranked.invoice_date,
+        ranked.invoice_status,
+        ranked.vendor_name
+      FROM (
+        SELECT
+          gi.inventory_id,
+          vii.confirmed_rate,
+          vi.id                   AS invoice_id,
+          vi.invoice_number,
+          vi.invoice_date,
+          vi.status               AS invoice_status,
+          vi.vendor_name_snapshot AS vendor_name,
+          ROW_NUMBER() OVER (
+            PARTITION BY gi.inventory_id
+            ORDER BY vi.invoice_date DESC, vi.confirmed_at DESC, vi.id DESC, vii.id DESC
+          ) AS rn
+        FROM vendor_invoice_items vii
+        JOIN vendor_invoices vi ON vi.id = vii.vendor_invoice_id
+        JOIN grn_items gi ON gi.id = vii.grn_item_id
+        WHERE vi.is_deleted = FALSE
+          AND vi.status IN ('CONFIRMED', 'FINALIZED')
+      ) ranked
+      WHERE ranked.rn = 1
+    `);
+    res.status(200).json(rows);
+  } catch (error: any) {
+    console.error('Error fetching last vendor invoice rates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 api.get('/inventory/additions', authorizeAction('inventory', 'view'), async (req, res) => {
   const { search, from_date, to_date } = req.query;
   try {

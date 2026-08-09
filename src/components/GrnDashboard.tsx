@@ -294,11 +294,25 @@ function GrnViewModal({ grn, onClose, onDownloadPdf }: GrnViewModalProps) {
   );
 }
 
+/**
+ * Display formatting for the reference rate. The stored DECIMAL(18,6) value is never altered.
+ *
+ * The ceiling matches the column's scale so every stored digit survives to the screen, and the
+ * floor of 0 lets Intl drop trailing zeros — 270.000000 reads as ₹270, 270.123456 stays whole.
+ */
+const lastInvoiceRateFormatter = new Intl.NumberFormat('en-IN', {
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 6
+});
+
 export function GrnDashboard({ role, userName }: GrnDashboardProps) {
   const { user: currentUser } = useAuth();
   const { hasPermission, canCreate, canEdit } = usePermissions();
   const [grns, setGrns] = useState<any[]>([]);
   const [inventory, setInventory] = useState<any[]>([]);
+  // Reference-only: last CONFIRMED/FINALIZED vendor invoice rate keyed by inventory_id.
+  // Displayed beside each dropdown option; never written into any GRN field.
+  const [lastInvoiceRates, setLastInvoiceRates] = useState<Record<string, string>>({});
   const [categories, setCategories] = useState<any[]>([]);
   const [masterUnits, setMasterUnits] = useState<any[]>([]);
   const [quickRegisterOpen, setQuickRegisterOpen] = useState(false);
@@ -375,7 +389,7 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
       const grnQuery = `?${params.toString()}`;
       const historyQuery = `?page=${currentPage}&limit=10${filters.search ? `&search=${filters.search}` : ''}`;
 
-      const [grnRes, invRes, vendorRes, projectRes, historyRes, poRes, catRes, unitRes] = await Promise.all([
+      const [grnRes, invRes, vendorRes, projectRes, historyRes, poRes, catRes, unitRes, lastRateRes] = await Promise.all([
         fetch(`${API_CONFIG.BASE_URL}/grns${grnQuery}`, { headers }),
         fetch(`${API_CONFIG.BASE_URL}/inventory`, { headers }),
         fetch(`${API_CONFIG.BASE_URL}/master/vendors`, { headers }),
@@ -383,7 +397,8 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
         fetch(`${API_CONFIG.BASE_URL}/grn-edit-history${historyQuery}`, { headers }),
         fetch(`${API_CONFIG.BASE_URL}/procurement/po`, { headers }),
         fetch(`${API_CONFIG.BASE_URL}/master/categories`, { headers }),
-        fetch(`${API_CONFIG.BASE_URL}/master/units`, { headers })
+        fetch(`${API_CONFIG.BASE_URL}/master/units`, { headers }),
+        fetch(`${API_CONFIG.BASE_URL}/inventory/last-invoice-rates`, { headers })
       ]);
       
       if (activeTab === 'EDITED') {
@@ -411,6 +426,15 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
       }
       
       if (invRes.ok) setInventory(await invRes.json());
+      if (lastRateRes.ok) {
+        const rateRows = await lastRateRes.json();
+        // Keep the raw DECIMAL(18,6) string from the driver — formatting happens at render time.
+        setLastInvoiceRates(
+          Object.fromEntries(
+            (Array.isArray(rateRows) ? rateRows : []).map((r: any) => [String(r.inventory_id), r.last_invoice_rate])
+          )
+        );
+      }
       if (vendorRes.ok) setMasterVendors(await vendorRes.json());
       if (projectRes.ok) setMasterProjects(await projectRes.json());
       if (poRes.ok) setPurchaseOrders(await poRes.json());
@@ -476,6 +500,18 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
 
   const removeItem = (index: number) => {
     setItems(items.filter((_, i) => i !== index));
+  };
+
+  /**
+   * Secondary text for a dropdown option: the last CONFIRMED/FINALIZED vendor invoice rate.
+   * Reference only — this value is never copied into Estimated Rate or any other GRN field.
+   */
+  const lastInvoiceRateLabel = (item: { id: string | number }): string => {
+    const raw = lastInvoiceRates[String(item.id)];
+    if (raw === undefined || raw === null) return 'No previous rate';
+    const value = parseFloat(String(raw));
+    if (!Number.isFinite(value)) return 'No previous rate';
+    return `₹${lastInvoiceRateFormatter.format(value)}`;
   };
 
   const updateItem = (index: number, field: string, value: any) => {
@@ -1243,7 +1279,7 @@ export function GrnDashboard({ role, userName }: GrnDashboardProps) {
                         <div className="flex gap-2">
                           <div className="flex-1">
                             <SearchableSelect
-                              options={toMaterialOptions(inventory)}
+                              options={toMaterialOptions(inventory, lastInvoiceRateLabel)}
                               value={item.inventory_id}
                               onChange={(val: any) => updateItem(index, 'inventory_id', val)}
                               placeholder="Choose item..."

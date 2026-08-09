@@ -180,7 +180,16 @@ export function SearchableSelect({ options, value, onChange, placeholder, disabl
                   onMouseEnter={() => setHighlightedIndex(index)}
                   onClick={() => commit(option)}
                 >
-                  {option.label}
+                  {option.secondaryLabel ? (
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className="min-w-0 truncate">{option.label}</span>
+                      <span className="shrink-0 text-xs font-semibold text-gray-500 tabular-nums">
+                        {option.secondaryLabel}
+                      </span>
+                    </div>
+                  ) : (
+                    option.label
+                  )}
                 </div>
               ))}
             </div>
