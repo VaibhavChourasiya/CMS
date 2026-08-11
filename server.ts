@@ -8230,7 +8230,7 @@ api.get('/procurement/po/:id/pdf', authorizeAction('procurement', 'export'), asy
       `SELECT po.*, v.vendor_name, v.contact_person, v.phone, v.address, v.gst_number, p.name as project_name
        FROM purchase_orders po
        JOIN vendors v ON po.vendor_id = v.id
-       JOIN projects p ON po.project_id = p.id
+       LEFT JOIN projects p ON po.project_id = p.id
        WHERE po.id = ? AND po.is_deleted = FALSE`,
       [id]
     );
@@ -8239,7 +8239,7 @@ api.get('/procurement/po/:id/pdf', authorizeAction('procurement', 'export'), asy
     const [itemRows]: any = await pool.execute(
       `SELECT pi.*, inv.unit
        FROM procurement_items pi
-       JOIN inventory inv ON pi.inventory_id = inv.id
+       LEFT JOIN inventory inv ON pi.inventory_id = inv.id
        WHERE pi.parent_type = 'PO' AND pi.parent_id = ?`,
       [id]
     );
