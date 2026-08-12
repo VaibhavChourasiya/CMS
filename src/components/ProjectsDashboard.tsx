@@ -381,6 +381,37 @@ export function ProjectsDashboard({ role }: ProjectsDashboardProps) {
     }
   };
 
+  /**
+   * Download a Financial Summary export.
+   *
+   * The report endpoints authenticate via the Authorization header only, and a browser
+   * navigation cannot carry one — so the file is fetched with the session token and saved
+   * from a Blob rather than opened. createAuthHeaders() resolves the token through
+   * getAuthToken(), which covers both the localStorage and sessionStorage login modes.
+   */
+  const handleExportFinancials = async (format: 'pdf' | 'excel') => {
+    const fileName = format === 'pdf' ? 'Project_Financial_Report.pdf' : 'Project_Financials.xlsx';
+    try {
+      const response = await fetch(`${API_CONFIG.BASE_URL}/reports/project-financials/${format}`, {
+        headers: createAuthHeaders()
+      });
+      if (!response.ok) throw new Error(`Export failed with status ${response.status}`);
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', fileName);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode?.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Project Financial export error:', error);
+      alert(`Unable to generate Project Financial ${format === 'pdf' ? 'PDF' : 'Excel'}`);
+    }
+  };
+
   return (
     <>
       <div className="flex justify-between items-center mb-6">
@@ -430,14 +461,14 @@ export function ProjectsDashboard({ role }: ProjectsDashboardProps) {
       {statusTab === 'FINANCIALS' && (
         <div className="flex justify-end space-x-3 mb-4">
           <button 
-            onClick={() => window.open(`${API_CONFIG.BASE_URL}/reports/project-financials/pdf?token=${localStorage.getItem('token')}`, '_blank')}
+            onClick={() => handleExportFinancials('pdf')}
             className="px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-xs font-bold hover:bg-red-100 flex items-center border border-red-200"
           >
             <FileText className="w-3.5 h-3.5 mr-2" />
             Export PDF
           </button>
           <button 
-            onClick={() => window.open(`${API_CONFIG.BASE_URL}/reports/project-financials/excel?token=${localStorage.getItem('token')}`, '_blank')}
+            onClick={() => handleExportFinancials('excel')}
             className="px-3 py-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-xs font-bold hover:bg-emerald-100 flex items-center border border-emerald-200"
           >
             <FileSpreadsheet className="w-3.5 h-3.5 mr-2" />

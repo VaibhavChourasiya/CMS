@@ -216,6 +216,37 @@ export function ContractorPaymentsDashboard({ role }: ContractorPaymentsDashboar
     }
   };
 
+  /**
+   * Download a Contractor Ledger export.
+   *
+   * The report endpoints authenticate via the Authorization header only, and a browser
+   * navigation cannot carry one — so the file is fetched with the session token and saved
+   * from a Blob rather than opened. createAuthHeaders() resolves the token through
+   * getAuthToken(), which covers both the localStorage and sessionStorage login modes.
+   */
+  const handleExportLedger = async (format: 'pdf' | 'excel') => {
+    const fileName = format === 'pdf' ? 'Contractor_Ledger_Report.pdf' : 'Contractor_Ledger.xlsx';
+    try {
+      const response = await fetch(`${API_CONFIG.BASE_URL}/reports/contractor-ledger/${format}`, {
+        headers: createAuthHeaders()
+      });
+      if (!response.ok) throw new Error(`Export failed with status ${response.status}`);
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', fileName);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode?.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Contractor Ledger export error:', error);
+      alert(`Unable to generate Contractor Ledger ${format === 'pdf' ? 'PDF' : 'Excel'}`);
+    }
+  };
+
   if (loading) return <div className="p-8 text-center">Loading Contractor Payments...</div>;
 
   return (
@@ -353,14 +384,14 @@ export function ContractorPaymentsDashboard({ role }: ContractorPaymentsDashboar
         <>
         <div className="flex justify-end space-x-3 mb-4">
           <button 
-            onClick={() => window.open(`${API_CONFIG.BASE_URL}/reports/contractor-ledger/pdf?token=${localStorage.getItem('token')}`, '_blank')}
+            onClick={() => handleExportLedger('pdf')}
             className="px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-xs font-bold hover:bg-red-100 flex items-center border border-red-200"
           >
             <FileText className="w-3.5 h-3.5 mr-2" />
             Export PDF
           </button>
           <button 
-            onClick={() => window.open(`${API_CONFIG.BASE_URL}/reports/contractor-ledger/excel?token=${localStorage.getItem('token')}`, '_blank')}
+            onClick={() => handleExportLedger('excel')}
             className="px-3 py-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-xs font-bold hover:bg-emerald-100 flex items-center border border-emerald-200"
           >
             <FileSpreadsheet className="w-3.5 h-3.5 mr-2" />
