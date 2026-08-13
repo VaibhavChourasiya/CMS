@@ -148,6 +148,38 @@ export function VendorMaster({ userRole, permissions }: VendorMasterProps) {
     (v.contact_person?.toLowerCase().includes(searchTerm.toLowerCase()))
   );
 
+  /**
+   * Vendor categories are chosen at parent level only.
+   *
+   * The categories table has no parent_id — a logical parent is expressed as several rows
+   * sharing the same category_name, each carrying a different sub_category_name. So a parent
+   * is identified by its NAME and its value is the FULL set of child ids. Grouping must keep
+   * every child id: collapsing a name to one representative row previously hid the ids that
+   * existing vendors were saved against, so those vendors silently lost their mapping.
+   */
+  const parentCategories = Array.from(
+    categories.reduce((groups, category) => {
+      const childIds = groups.get(category.category_name) || [];
+      childIds.push(category.id);
+      groups.set(category.category_name, childIds);
+      return groups;
+    }, new Map<string, number[]>())
+  ).map(([name, childIds]) => ({ name, childIds }));
+
+  /** Checked when ANY child id is mapped — a vendor saved against one sub-category still counts. */
+  const isParentSelected = (childIds: number[]) => childIds.some(id => formData.category_ids.includes(id));
+
+  /** Selecting adds every child id; clearing removes only this parent's ids, leaving others intact. */
+  const toggleParentCategory = (childIds: number[]) => {
+    const selected = isParentSelected(childIds);
+    setFormData({
+      ...formData,
+      category_ids: selected
+        ? formData.category_ids.filter(id => !childIds.includes(id))
+        : [...formData.category_ids, ...childIds.filter(id => !formData.category_ids.includes(id))]
+    });
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
@@ -293,38 +325,47 @@ export function VendorMaster({ userRole, permissions }: VendorMasterProps) {
               </div>
               <div className="space-y-2">
                 <label className="text-xs font-bold text-gray-500 uppercase tracking-wider">Vendor Categories</label>
-                <select
-                  multiple
-                  className="w-full px-4 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none"
-                  value={formData.category_ids.map(id => String(id))}
-                  onChange={(e) => {
-                    const selectedOptions = Array.from(e.target.selectedOptions);
-                    const selectedIds = selectedOptions.map(option => parseInt(option.value, 10));
-                    setFormData({ ...formData, category_ids: selectedIds });
-                  }}
-                >
-                  {Array.from(new Map(categories.map(c => [c.category_name, c])).values()).map(category => (
-                    <option key={category.id} value={String(category.id)}>
-                      {category.category_name}
-                    </option>
-                  ))}
-                </select>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {formData.category_ids.map(catId => {
-                    const cat = categories.find(c => c.id === catId);
-                    return cat ? (
-                      <span key={catId} className="inline-flex items-center px-2 py-1 rounded-full text-xs font-bold bg-blue-100 text-blue-700">
-                        {cat.category_name}
-                        <button
-                          type="button"
-                          onClick={() => setFormData({ ...formData, category_ids: formData.category_ids.filter(id => id !== catId) })}
-                          className="ml-1 hover:text-blue-900"
-                        >
-                          <XCircle className="w-3 h-3" />
-                        </button>
-                      </span>
-                    ) : null;
+                {/*
+                  Toggle list rather than a native <select multiple>: a plain click on a native
+                  multi-select replaces the whole selection, so adding a second category silently
+                  dropped the first unless the user held Ctrl/Cmd.
+                  One row per parent category name — sub-categories are an inventory-level detail
+                  and are never surfaced here, because vendor eligibility is decided at parent level.
+                */}
+                <div className="max-h-48 overflow-y-auto bg-gray-50 border border-gray-200 rounded-lg divide-y divide-gray-100">
+                  {parentCategories.map(parent => {
+                    const checked = isParentSelected(parent.childIds);
+                    return (
+                      <label
+                        key={parent.name}
+                        className={`flex items-center gap-3 px-4 py-2 cursor-pointer transition-colors ${checked ? 'bg-blue-50' : 'hover:bg-gray-100'}`}
+                      >
+                        <input
+                          type="checkbox"
+                          className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-2 focus:ring-blue-500/20"
+                          checked={checked}
+                          onChange={() => toggleParentCategory(parent.childIds)}
+                        />
+                        <span className={`text-sm ${checked ? 'font-bold text-blue-700' : 'text-gray-700'}`}>
+                          {parent.name}
+                        </span>
+                      </label>
+                    );
                   })}
+                </div>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {parentCategories.filter(parent => isParentSelected(parent.childIds)).map(parent => (
+                    <span key={parent.name} className="inline-flex items-center px-2 py-1 rounded-full text-xs font-bold bg-blue-100 text-blue-700">
+                      {parent.name}
+                      <button
+                        type="button"
+                        onClick={() => toggleParentCategory(parent.childIds)}
+                        className="ml-1 hover:text-blue-900"
+                      >
+                        <XCircle className="w-3 h-3" />
+                      </button>
+                    </span>
+                  ))}
                 </div>
               </div>
               <div className="space-y-1">
