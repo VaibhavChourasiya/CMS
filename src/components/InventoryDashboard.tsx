@@ -32,6 +32,11 @@ export function InventoryDashboard({ role }: InventoryDashboardProps) {
   const [isRevertModalOpen, setIsRevertModalOpen] = useState(false);
   const [selectedIssueToRevert, setSelectedIssueToRevert] = useState<any>(null);
   const [revertReason, setRevertReason] = useState('');
+  // Item Layer being reverted in full (null = modal closed). Holds the row straight from
+  // GET /inventory/issues, so no extra lookup is needed to show its details.
+  const [revertingItem, setRevertingItem] = useState<any>(null);
+  const [itemRevertReason, setItemRevertReason] = useState('');
+  const [isRevertingItem, setIsRevertingItem] = useState(false);
   const [isReverting, setIsReverting] = useState(false);
 
   const [itemName, setItemName] = useState('');
@@ -485,6 +490,43 @@ export function InventoryDashboard({ role }: InventoryDashboardProps) {
     }
   };
 
+  /**
+   * Revert one Item Layer in full.
+   *
+   * Reuses the existing item-level endpoint, whose contract is a reason only — there is no
+   * quantity parameter, so an item is always reverted in its entirety. The backend also
+   * decides the resulting voucher status (PARTIALLY_REVERTED vs FULLY_REVERTED), so nothing
+   * about voucher state is computed here.
+   */
+  const handleRevertItem = async () => {
+    if (!revertingItem) return;
+    if (itemRevertReason.trim().length < 5) {
+      alert('A revert reason of at least 5 characters is required.');
+      return;
+    }
+    setIsRevertingItem(true);
+    try {
+      const res = await fetch(`${API_CONFIG.BASE_URL}/inventory/vouchers/items/revert/${revertingItem.id}`, {
+        method: 'POST',
+        headers: createAuthHeaders(true),
+        body: JSON.stringify({ reason: itemRevertReason })
+      });
+      if (res.ok) {
+        setRevertingItem(null);
+        setItemRevertReason('');
+        fetchData();
+        alert('Item reverted successfully');
+      } else {
+        const err = await res.json();
+        alert(err.error || 'Failed to revert item');
+      }
+    } catch (e) {
+      alert('Revert failed');
+    } finally {
+      setIsRevertingItem(false);
+    }
+  };
+
   const handleRevertVoucher = async (id: number, reason: string) => {
     if (!reason) return;
     try {
@@ -810,11 +852,12 @@ export function InventoryDashboard({ role }: InventoryDashboardProps) {
                       <th className="px-6 py-4 text-right">Consumption Cost</th>
                       <th className="px-6 py-4">Project</th>
                       <th className="px-6 py-4">Issued To/By</th>
+                      <th className="px-6 py-4 text-center">Revert</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 text-sm">
                     {issues.length === 0 ? (
-                      <tr><td colSpan={7} className="px-6 py-12 text-center text-gray-500">No issue history found.</td></tr>
+                      <tr><td colSpan={8} className="px-6 py-12 text-center text-gray-500">No issue history found.</td></tr>
                     ) : issues.map((issue) => (
                       <tr key={issue.id} className="hover:bg-gray-50/50 transition-colors">
                         <td className="px-6 py-4 whitespace-nowrap text-gray-600 font-medium">{new Date(issue.issue_date).toLocaleDateString()}</td>
@@ -833,6 +876,28 @@ export function InventoryDashboard({ role }: InventoryDashboardProps) {
                         <td className="px-6 py-4">
                           <div className="text-gray-900 font-medium">To: {issue.issued_to}</div>
                           <div className="text-[10px] text-gray-400">By: {issue.issued_by}</div>
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          {issue.revert_status === 'REVERTED' ? (
+                            <span
+                              className="inline-flex px-2 py-0.5 rounded text-[10px] font-black uppercase bg-red-50 text-red-600 border border-red-100"
+                              title={issue.revert_reason ? `Reason: ${issue.revert_reason}` : undefined}
+                            >
+                              Reverted
+                            </span>
+                          ) : canRevert ? (
+                            <button
+                              type="button"
+                              onClick={() => { setRevertingItem(issue); setItemRevertReason(''); }}
+                              title="Revert this entire item"
+                              className="inline-flex items-center px-2.5 py-1 rounded-lg text-[10px] font-black uppercase text-red-600 bg-red-50 border border-red-200 hover:bg-red-100 transition-colors"
+                            >
+                              <ArrowDownRight className="w-3.5 h-3.5 rotate-180 mr-1" />
+                              Revert
+                            </button>
+                          ) : (
+                            <span className="text-[10px] text-gray-300">—</span>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -1326,6 +1391,93 @@ export function InventoryDashboard({ role }: InventoryDashboardProps) {
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Item Layer Full Revert Modal — reverts the whole item; there is deliberately no quantity input */}
+      {revertingItem && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center bg-red-50">
+              <h3 className="text-base font-bold text-red-700 flex items-center">
+                <ArrowDownRight className="w-5 h-5 rotate-180 mr-2" />
+                Revert Item Layer
+              </h3>
+              <button onClick={() => setRevertingItem(null)} className="text-gray-400 hover:text-gray-600">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <div className="bg-gray-50 rounded-lg border border-gray-200 divide-y divide-gray-100 text-sm">
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Item</span>
+                  <span className="font-bold text-gray-900 text-right">{revertingItem.item_name}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">GRN / UOS</span>
+                  <span className="font-bold text-gray-900">{revertingItem.grn_number || '—'}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Voucher / MIV</span>
+                  <span className="font-bold text-gray-900">{revertingItem.voucher_no || 'Legacy'}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Project</span>
+                  <span className="font-bold text-gray-900 text-right">{revertingItem.project_name}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Issued To / By</span>
+                  <span className="font-bold text-gray-900 text-right">{revertingItem.issued_to} / {revertingItem.issued_by}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Quantity</span>
+                  <span className="font-black text-amber-700">{revertingItem.quantity} {revertingItem.unit || ''}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Consumption Cost</span>
+                  <span className="font-black text-slate-900">₹{parseFloat(revertingItem.total_cost || 0).toLocaleString()}</span>
+                </div>
+                <div className="px-4 py-2 flex justify-between">
+                  <span className="text-gray-500">Current Status</span>
+                  <span className="font-black text-emerald-600 uppercase text-[11px]">{revertingItem.revert_status || 'ACTIVE'}</span>
+                </div>
+              </div>
+
+              <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-xs font-bold text-red-700">
+                This will revert the entire item ({revertingItem.quantity} {revertingItem.unit || 'units'}). Partial quantities cannot be reverted.
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-gray-500 uppercase mb-1">Revert Reason (Governance Audit)</label>
+                <textarea
+                  rows={3}
+                  value={itemRevertReason}
+                  onChange={(e) => setItemRevertReason(e.target.value)}
+                  placeholder="Mandatory explanation for restoration (min 5 characters)..."
+                  className="w-full px-3 py-2 border border-red-200 rounded-lg text-sm bg-red-50/30 focus:ring-2 focus:ring-red-500 outline-none resize-none"
+                />
+              </div>
+            </div>
+
+            <div className="px-6 py-4 bg-gray-50 border-t border-gray-200 flex justify-end space-x-3">
+              <button
+                type="button"
+                onClick={() => setRevertingItem(null)}
+                className="px-4 py-2 text-sm font-bold text-gray-600 hover:text-gray-900"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isRevertingItem || itemRevertReason.trim().length < 5}
+                onClick={handleRevertItem}
+                className="px-5 py-2 bg-red-600 text-white text-sm font-black rounded-lg hover:bg-red-700 shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isRevertingItem ? 'Reverting...' : 'Confirm Revert'}
+              </button>
             </div>
           </div>
         </div>

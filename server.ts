@@ -4782,6 +4782,34 @@ api.post('/inventory/vouchers/items/revert/:itemId', authorizeAction('inventory'
     // 5. Sync Master Inventory
     await syncInventoryFromBatches(connection, item.inventory_id);
 
+    // 6. Reuse the existing audit mechanism (no new logging implementation).
+    // Runs on the same connection inside this transaction, so a rollback discards the log too.
+    // The voucher row is not otherwise loaded here, so its number/project are read once.
+    const [voucherRows]: any = await connection.execute(
+      `SELECT miv.voucher_no, miv.project_id, miv.issued_to, p.name AS project_name
+       FROM material_issue_vouchers miv
+       LEFT JOIN projects p ON p.id = miv.project_id
+       WHERE miv.id = ?`,
+      [item.voucher_id]
+    );
+    const voucher = voucherRows[0] || {};
+
+    await logErpActivity(connection, {
+      actor: session,
+      module: 'inventory',
+      action: 'REVERT',
+      entityType: 'MATERIAL_ISSUE_ITEM',
+      entityId: Number(itemId),
+      projectId: voucher.project_id || null,
+      targetUrl: `/inventory?voucher_id=${item.voucher_id}`,
+      details: {
+        recordNumber: voucher.voucher_no,
+        projectName: voucher.project_name,
+        amount: parseFloat(item.total_cost || '0'),
+        remarks: `Material Issue Item reverted. Item: ${item.item_name}. Quantity: ${item.quantity}${item.unit ? ` ${item.unit}` : ''}. GRN/UOS: ${item.grn_number || 'N/A'}. Reason: ${String(reason).trim()}. Voucher Status: ${newStatus}.`
+      }
+    });
+
     await connection.commit();
     res.status(200).json({ message: 'Item reverted successfully' });
   } catch (error: any) {
