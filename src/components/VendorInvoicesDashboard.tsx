@@ -2218,6 +2218,36 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
         .animate-fade-in {
           animation: fadeIn 0.2s ease-out forwards;
         }
+
+        /*
+          Print only the invoice document.
+
+          The app shell is a fixed-viewport layout — h-screen + overflow-hidden on the root,
+          h-full + overflow-hidden on <main>, and overflow-y-auto on the content region. Left
+          in that flow the invoice is clipped at one viewport height, which is why long item
+          lists stopped partway through the printout. Taking #printable-invoice-detail out of
+          flow with position: absolute lets it paginate across pages normally, and is the same
+          approach GrnDashboard and InventoryLedgerReport already use.
+
+          visibility (rather than display) hides the shell without collapsing the layout the
+          absolutely-positioned container is measured against.
+        */
+        @media print {
+          body * { visibility: hidden; }
+          #printable-invoice-detail, #printable-invoice-detail * { visibility: visible; }
+          #printable-invoice-detail {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            padding: 0 !important;
+            margin: 0 !important;
+          }
+          /* Section 2/3 table wrappers use overflow-hidden for rounded corners; that clips
+             rows once the table spans a page boundary. */
+          #printable-invoice-detail .overflow-hidden { overflow: visible !important; }
+          .no-print { display: none !important; }
+        }
       `}</style>
     </div>
   );
