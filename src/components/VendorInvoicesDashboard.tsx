@@ -1364,7 +1364,7 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
               <div className="text-slate-500 font-bold">Loading detailed ERP invoice data...</div>
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 invoice-print-body">
               {/* Left Column (Core Tables) */}
               <div className="lg:col-span-2 space-y-6">
                 {/* Section 1 – Invoice Information */}
@@ -2220,25 +2220,17 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
         }
 
         /*
-          Print only the invoice document.
+          Print the invoice document.
 
-          The app shell is a fixed-viewport layout — h-screen + overflow-hidden on the root,
-          h-full + overflow-hidden on <main>, and overflow-y-auto on the content region. Left
-          in that flow the invoice is clipped at one viewport height, which is why long item
-          lists stopped partway through the printout. Taking #printable-invoice-detail out of
-          flow with position: absolute lets it paginate across pages normally, and is the same
-          approach GrnDashboard and InventoryLedgerReport already use.
+          The shell is excluded and the viewport clipping released in App.tsx, so the invoice
+          stays in NORMAL document flow here. That is what allows Section 3 to fragment across
+          as many pages as its content needs — an out-of-flow (position: absolute) container is
+          painted only on the page where it starts, which capped the printout at one page.
 
-          visibility (rather than display) hides the shell without collapsing the layout the
-          absolutely-positioned container is measured against.
+          Nothing below limits how many rows print; page count follows content height.
         */
         @media print {
-          body * { visibility: hidden; }
-          #printable-invoice-detail, #printable-invoice-detail * { visibility: visible; }
           #printable-invoice-detail {
-            position: absolute;
-            left: 0;
-            top: 0;
             width: 100%;
             padding: 0 !important;
             margin: 0 !important;
@@ -2246,7 +2238,14 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
           /* Section 2/3 table wrappers use overflow-hidden for rounded corners; that clips
              rows once the table spans a page boundary. */
           #printable-invoice-detail .overflow-hidden { overflow: visible !important; }
-          .no-print { display: none !important; }
+          /* The two-column layout is a grid; grid items fragment unreliably across pages.
+             At print width it is already a single column, so block flow is visually identical
+             and paginates predictably. Sections then print in order 1, 2, 3, 4. */
+          #printable-invoice-detail .invoice-print-body { display: block !important; }
+          #printable-invoice-detail .invoice-print-body > * + * { margin-top: 1.5rem; }
+          /* Repeat the Section 3 column headings on every continuation page. */
+          #printable-invoice-detail thead { display: table-header-group; }
+          #printable-invoice-detail tr { break-inside: avoid; page-break-inside: avoid; }
         }
       `}</style>
     </div>

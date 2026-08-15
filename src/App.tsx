@@ -119,9 +119,9 @@ export default function App() {
   }
 
   return (
-    <div className="h-screen bg-gray-50 flex overflow-hidden">
+    <div className="h-screen bg-gray-50 flex overflow-hidden app-print-root">
       {/* Sidebar */}
-      <aside className={`bg-slate-900 text-white transition-all duration-300 ${sidebarOpen ? 'w-64' : 'w-20'} flex flex-col h-full flex-shrink-0 z-20 shadow-xl`}>
+      <aside className={`bg-slate-900 text-white transition-all duration-300 ${sidebarOpen ? 'w-64' : 'w-20'} flex flex-col h-full flex-shrink-0 z-20 shadow-xl no-print`}>
         <div className="h-16 flex items-center justify-center border-b border-slate-800">
           <Building2 className="w-8 h-8 text-blue-500" />
           {sidebarOpen && <span className="ml-3 font-bold text-xl tracking-tight">BuildCore CMS</span>}
@@ -171,9 +171,9 @@ export default function App() {
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0 h-full overflow-hidden relative">
+      <main className="flex-1 flex flex-col min-w-0 h-full overflow-hidden relative app-print-main">
         {/* Top Header */}
-        <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6 flex-shrink-0 z-10">
+        <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6 flex-shrink-0 z-10 no-print">
           <div className="flex items-center">
             <button onClick={() => setSidebarOpen(!sidebarOpen)} className="text-gray-500 hover:text-gray-700">
               <Menu className="w-6 h-6" />
@@ -200,7 +200,7 @@ export default function App() {
         </header>
 
         {/* Dashboard Content */}
-        <div className={`flex-1 overflow-y-auto custom-scrollbar ${activeTab === 'masters' ? '' : 'p-6'}`}>
+        <div className={`flex-1 overflow-y-auto custom-scrollbar app-print-content ${activeTab === 'masters' ? '' : 'p-6'}`}>
           {activeTab === 'security' && hasPermission(loggedInRole, 'rbac', 'manage_rbac') ? (
             <CeoSecuritySettings />
           ) : activeTab === 'masters' ? (
@@ -234,11 +234,48 @@ export default function App() {
         </div>
       </main>
 
-      <ActivityCenterSlideOver 
-        isOpen={activityCenterOpen} 
-        onClose={() => setActivityCenterOpen(false)} 
-        onNavigate={handleNavigate} 
+      <ActivityCenterSlideOver
+        isOpen={activityCenterOpen}
+        onClose={() => setActivityCenterOpen(false)}
+        onNavigate={handleNavigate}
       />
+
+      {/*
+        Print layout.
+
+        On screen the shell is a fixed-viewport frame: h-screen + overflow-hidden on the root,
+        h-full + overflow-hidden on <main>, and the module rendered inside an overflow-y-auto
+        region. Those constraints are what clip a long document to a single page when printing,
+        because the browser paginates the normal flow and this flow is capped at one viewport.
+
+        Releasing the height and overflow here lets module content stay IN normal flow and
+        fragment across as many pages as it needs — no out-of-flow positioning required.
+        Screen rendering is untouched; every rule is inside @media print.
+      */}
+      <style>{`
+        @media print {
+          html, body {
+            height: auto !important;
+            overflow: visible !important;
+          }
+          /* Application chrome never belongs in a printed document. display:none rather than
+             visibility:hidden so it occupies no space in the printed flow. */
+          .no-print { display: none !important; }
+
+          .app-print-root,
+          .app-print-main {
+            display: block !important;
+            height: auto !important;
+            overflow: visible !important;
+          }
+          .app-print-content {
+            flex: none !important;
+            height: auto !important;
+            overflow: visible !important;
+            padding: 0 !important;
+          }
+        }
+      `}</style>
     </div>
   );
 }
