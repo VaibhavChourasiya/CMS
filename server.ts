@@ -4315,6 +4315,134 @@ api.post('/inventory/opening-stock', authorizeAction('inventory', 'create'), asy
   }
 });
 
+/**
+ * Correct an Update Opening Stock entry.
+ *
+ * Only an UNTOUCHED layer may be edited — quantity_remaining must still equal
+ * quantity_received. Once any quantity has been issued, the consumed portion is frozen
+ * inside material_issue_items.batch_details (cost is snapshotted at issue time), so
+ * re-rating the layer would leave the batch and its consumption permanently disagreeing.
+ * Partially consumed, fully consumed and voided layers are therefore locked here.
+ *
+ * The untouched test is re-checked under FOR UPDATE inside the transaction, because an MIV
+ * can consume the layer between the user opening the form and submitting it.
+ *
+ * The UOS predicate (grn_id IS NULL AND batch_number LIKE 'UOS-%') is enforced in the
+ * WHERE clause, so a GRN batch id can never be reached through this route.
+ */
+api.put('/inventory/opening-stock/:id', authorizeAction('inventory', 'edit'), async (req, res) => {
+  const { id } = req.params;
+  const { quantity, unit_cost, reason } = req.body;
+  const user = (req as any).user as Session;
+
+  const qty = parseFloat(quantity);
+  const cost = parseFloat(unit_cost);
+
+  if (isNaN(qty) || qty <= 0) {
+    return res.status(400).json({ error: 'A valid quantity (> 0) is required.' });
+  }
+  if (isNaN(cost) || cost <= 0) {
+    return res.status(400).json({ error: 'A valid rate (> 0) is required.' });
+  }
+  if (!reason || String(reason).trim().length < 5) {
+    return res.status(400).json({ error: 'An edit reason of at least 5 characters is required.' });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    // Lock the row. The UOS predicate is part of the WHERE clause so a GRN batch is unreachable.
+    const [rows]: any = await connection.execute(
+      `SELECT b.*, i.item_name
+       FROM inventory_batches b
+       JOIN inventory i ON i.id = b.inventory_id
+       WHERE b.id = ? AND b.grn_id IS NULL AND b.batch_number LIKE 'UOS-%'
+       FOR UPDATE`,
+      [id]
+    );
+    if (rows.length === 0) {
+      throw new AppError('NOT_FOUND', 'Opening stock entry not found. Only UOS records can be edited here.', 404);
+    }
+    const batch = rows[0];
+
+    if (batch.is_void) {
+      throw new AppError('BUSINESS_RULE_ERROR', 'This opening stock entry has been voided and cannot be edited.', 422);
+    }
+
+    const received = parseFloat(batch.quantity_received);
+    const remaining = parseFloat(batch.quantity_remaining);
+
+    if (remaining <= 0) {
+      throw new AppError('BUSINESS_RULE_ERROR', 'This opening stock has been fully consumed and cannot be edited.', 422);
+    }
+    if (remaining !== received) {
+      throw new AppError('BUSINESS_RULE_ERROR', 'This opening stock has already been partially consumed and cannot be edited.', 422);
+    }
+
+    const oldRate = parseFloat(batch.unit_price);
+    const quantityChanged = qty !== received;
+    const rateChanged = cost !== oldRate;
+
+    if (!quantityChanged && !rateChanged) {
+      await connection.rollback();
+      return res.status(200).json({ message: 'No changes to apply.', changed: false });
+    }
+
+    // Untouched layer: received and remaining move together, and value is always derived.
+    const newTotalValue = qty * cost;
+    await connection.execute(
+      `UPDATE inventory_batches
+       SET quantity_received = ?, quantity_remaining = ?,
+           unit_price = ?, total_value_received = ?, total_value_remaining = ?
+       WHERE id = ?`,
+      [qty, qty, cost, newTotalValue, newTotalValue, id]
+    );
+
+    // Reuse the existing rollup so quantity / total_value / moving-average cost stay consistent.
+    await syncInventoryFromBatches(connection, batch.inventory_id);
+
+    // Reuse the existing audit mechanism (no new logging implementation).
+    const changes: { field: string; oldValue: string | null; newValue: string | null }[] = [];
+    if (quantityChanged) changes.push({ field: 'quantity_received', oldValue: String(received), newValue: String(qty) });
+    if (rateChanged) changes.push({ field: 'unit_price', oldValue: String(oldRate), newValue: String(cost) });
+
+    await logErpActivity(connection, {
+      actor: user,
+      module: 'inventory',
+      action: 'UPDATE',
+      entityType: 'OPENING_STOCK',
+      entityId: Number(id),
+      targetUrl: `/inventory?id=${batch.inventory_id}`,
+      details: {
+        recordNumber: batch.batch_number,
+        amount: newTotalValue,
+        changes,
+        remarks: `Opening stock corrected for ${batch.item_name}. Reason: ${String(reason).trim()}`
+      }
+    });
+
+    await connection.commit();
+    res.status(200).json({
+      message: 'Opening stock updated successfully',
+      changed: true,
+      id: Number(id),
+      batch_number: batch.batch_number,
+      quantity: qty,
+      unit_cost: cost,
+      total_value: newTotalValue
+    });
+  } catch (error: any) {
+    await connection.rollback();
+    if (!(error instanceof AppError)) console.error('[API] opening-stock update error:', error);
+    res.status(error.statusCode || 500).json({
+      error: error instanceof AppError ? error.message : 'Failed to update opening stock.'
+    });
+  } finally {
+    connection.release();
+  }
+});
+
 api.delete('/inventory/:id', authorizeAction('inventory', 'delete'), async (req, res) => {
   const { id } = req.params;
   try {
@@ -5006,28 +5134,66 @@ api.get('/inventory/last-invoice-rates', authorizeAction('inventory', 'view'), a
   }
 });
 
+/**
+ * UOS (Update Opening Stock) history.
+ *
+ * Opening stock is stored as an inventory_batches layer, exactly like a GRN receipt — the
+ * two are distinguished only by grn_id being NULL and the UOS- batch_number prefix. Both
+ * conditions are applied here so a GRN layer can never be returned through this route.
+ *
+ * status is derived from the quantity columns rather than stored, and added_by comes from
+ * the ERP activity row written at creation (inventory_batches has no creator column).
+ */
 api.get('/inventory/additions', authorizeAction('inventory', 'view'), async (req, res) => {
   const { search, from_date, to_date } = req.query;
   try {
-    let query = 'SELECT * FROM inventory_additions WHERE is_deleted = FALSE';
+    let query = `
+      SELECT
+        b.id,
+        b.batch_number,
+        b.inventory_id,
+        i.item_name,
+        i.category,
+        i.unit,
+        b.quantity_received,
+        b.quantity_remaining,
+        b.unit_price,
+        b.total_value_received,
+        b.total_value_remaining,
+        b.received_date,
+        b.is_void,
+        b.createdAt,
+        CASE
+          WHEN b.is_void = TRUE THEN 'VOIDED'
+          WHEN b.quantity_remaining = b.quantity_received THEN 'UNTOUCHED'
+          WHEN b.quantity_remaining <= 0 THEN 'FULLY CONSUMED'
+          ELSE 'PARTIALLY CONSUMED'
+        END AS status,
+        act.actor_name_snapshot AS added_by
+      FROM inventory_batches b
+      JOIN inventory i ON i.id = b.inventory_id
+      LEFT JOIN erp_activity_logs act
+        ON act.entity_type = 'OPENING_STOCK' AND act.action = 'CREATE' AND act.entity_id = b.id
+      WHERE b.grn_id IS NULL AND b.batch_number LIKE 'UOS-%'
+    `;
     const params: any[] = [];
 
     if (search) {
-      query += ` AND (item_name LIKE ? OR remarks LIKE ? OR supplier LIKE ? OR added_by LIKE ?)`;
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+      query += ` AND (i.item_name LIKE ? OR b.batch_number LIKE ? OR i.category LIKE ?)`;
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
     }
 
     if (from_date) {
-      query += ` AND DATE(addition_date) >= ?`;
+      query += ` AND DATE(b.received_date) >= ?`;
       params.push(from_date);
     }
 
     if (to_date) {
-      query += ` AND DATE(addition_date) <= ?`;
+      query += ` AND DATE(b.received_date) <= ?`;
       params.push(to_date);
     }
 
-    query += ' ORDER BY addition_date DESC, createdAt DESC';
+    query += ' ORDER BY b.received_date DESC, b.id DESC';
 
     const [rows] = await pool.execute(query, params);
     res.status(200).json(rows);
