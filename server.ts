@@ -9502,6 +9502,286 @@ api.get('/vendor-invoices/:id', authorizeAction('vendor_invoices', 'view'), asyn
   }
 });
 
+/**
+ * Vendor Invoice audit sheet as a downloadable PDF.
+ *
+ * Only the invoice id is accepted — every figure is read server-side so nothing financial can
+ * be supplied by the caller.
+ *
+ * The numbers deliberately mirror what the Detail screen (and therefore Print Details) shows,
+ * which is derived from the linked GRNs rather than vendor_invoice_items: an item's rate is the
+ * confirmed rate once the invoice is FINALIZED and the estimated rate before that, and a GRN's
+ * amount is the corresponding sum over its items. Reproducing that rule here is what keeps the
+ * printed and downloaded documents in agreement.
+ *
+ * Linked GRNs and their items are each fetched in ONE query rather than per-GRN, avoiding the
+ * N+1 the browser currently performs.
+ */
+api.get('/vendor-invoices/:id/pdf', authorizeAction('vendor_invoices', 'export'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [invoices]: any = await pool.query(
+      `SELECT vi.*, v.vendor_name, v.gst_number, v.address,
+              COALESCE((SELECT SUM(vpa.allocated_amount) FROM vendor_payment_allocations vpa
+                        JOIN vendor_payments vp ON vpa.vendor_payment_id = vp.id
+                        WHERE vpa.vendor_invoice_id = vi.id AND vp.is_deleted = FALSE), 0) AS amount_paid
+       FROM vendor_invoices vi
+       JOIN vendors v ON vi.vendor_id = v.id
+       WHERE vi.id = ? AND vi.is_deleted = FALSE`,
+      [id]
+    );
+    if (invoices.length === 0) {
+      return res.status(404).json({ error: 'Vendor Invoice not found' });
+    }
+
+    const invoice = invoices[0];
+    const isFinalized = invoice.status === 'FINALIZED';
+    const amountPaid = parseFloat(invoice.amount_paid || '0');
+    const invoiceAmount = parseFloat(invoice.invoice_amount || '0');
+    const pendingAmount = invoiceAmount - amountPaid;
+    const paymentStatus = amountPaid >= invoiceAmount && invoiceAmount > 0
+      ? 'PAID'
+      : amountPaid > 0 ? 'PARTIALLY PAID' : 'UNPAID';
+
+    // Linked GRNs — one query for all of them, not one query per GRN.
+    // The two subtotals (and the fallback to the GRN header total for an item-less GRN) are
+    // computed the same way GET /grns/:id computes them, so the amounts shown here are the
+    // amounts the Detail screen shows.
+    const [grnRows]: any = await pool.query(
+      `SELECT g.id, g.grn_number, g.grn_date, p.name AS project_name,
+              COALESCE(gi_sum.confirmed_subtotal, g.total_amount) AS confirmed_total_amount,
+              COALESCE(gi_sum.estimated_subtotal, g.total_amount) AS estimated_total_amount
+       FROM vendor_invoice_grns vig
+       JOIN grns g ON g.id = vig.grn_id
+       LEFT JOIN projects p ON p.id = g.projectId
+       LEFT JOIN (
+         SELECT gi.grn_id,
+                SUM(COALESCE(gi.confirmed_rate, gi.rate) * gi.quantity) AS confirmed_subtotal,
+                SUM(gi.rate * gi.quantity) AS estimated_subtotal
+         FROM grn_items gi
+         GROUP BY gi.grn_id
+       ) gi_sum ON gi_sum.grn_id = g.id
+       WHERE vig.vendor_invoice_id = ? AND g.is_deleted = FALSE
+       ORDER BY g.grn_date ASC, g.id ASC`,
+      [id]
+    );
+
+    const linkedGrns = grnRows.map((g: any) => ({
+      grn_number: g.grn_number,
+      grn_date: g.grn_date,
+      project_name: g.project_name || 'Central Store',
+      amount: parseFloat(isFinalized ? g.confirmed_total_amount : g.estimated_total_amount) || 0
+    }));
+
+    // Section 4 Material Total mirrors the UI: the sum of the linked GRN amounts.
+    const materialTotal = linkedGrns.reduce((sum: number, g: any) => sum + g.amount, 0);
+
+    // Every item across all linked GRNs — one query, no LIMIT.
+    const [itemRows]: any = await pool.query(
+      `SELECT gi.inventory_id, gi.item_name, gi.quantity, gi.rate, gi.confirmed_rate, inv.unit
+       FROM vendor_invoice_grns vig
+       JOIN grns g ON g.id = vig.grn_id
+       JOIN grn_items gi ON gi.grn_id = g.id
+       LEFT JOIN inventory inv ON inv.id = gi.inventory_id
+       WHERE vig.vendor_invoice_id = ? AND g.is_deleted = FALSE
+       ORDER BY gi.item_name ASC, gi.id ASC`,
+      [id]
+    );
+
+    // Group by inventory item exactly as the Detail screen does.
+    const groupMap = new Map<string, { item_name: string; unit: string; total_quantity: number; receipts: number; amount: number }>();
+    for (const row of itemRows) {
+      const key = `${row.inventory_id}_${row.item_name}`;
+      const rate = parseFloat(isFinalized ? (row.confirmed_rate ?? row.rate) : row.rate) || 0;
+      const qty = parseFloat(row.quantity) || 0;
+      const existing = groupMap.get(key);
+      if (existing) {
+        existing.total_quantity += qty;
+        existing.receipts += 1;
+        existing.amount += qty * rate;
+      } else {
+        groupMap.set(key, {
+          item_name: row.item_name,
+          unit: row.unit || 'Nos',
+          total_quantity: qty,
+          receipts: 1,
+          amount: qty * rate
+        });
+      }
+    }
+    const groupedItems = Array.from(groupMap.values());
+
+    // ── PDF ────────────────────────────────────────────────────────────────────────────
+    const money = (n: number) => `INR ${Number(n || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    // Invoice numbers are free text, so strip anything a filesystem would reject before it
+    // reaches Content-Disposition.
+    const safeName = (String(invoice.invoice_number || '').trim() || `ID-${id}`)
+      .replace(/[\\/:*?"<>|,]/g, '-')
+      .replace(/\s+/g, '-');
+
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Vendor-Invoice-${safeName}.pdf"`);
+    doc.pipe(res);
+
+    const LEFT = 50;
+    const RIGHT = 545;
+    const PAGE_BOTTOM = 780;
+
+    doc.font('Helvetica-Bold').fontSize(20).fillColor('#1d4ed8').text('Vendor Invoice Audit Sheet', { align: 'center' });
+    doc.font('Helvetica-Bold').fontSize(12).fillColor('#111827').text(String(invoice.invoice_number || ''), { align: 'center' });
+    doc.font('Helvetica').fontSize(8).fillColor('#64748b')
+      .text(`Generated on: ${new Date().toLocaleString()}`, { align: 'center' });
+    doc.moveDown(1);
+    doc.moveTo(LEFT, doc.y).lineTo(RIGHT, doc.y).strokeColor('#cbd5e1').stroke();
+    doc.moveDown(1);
+
+    const sectionHeading = (label: string) => {
+      if (doc.y > PAGE_BOTTOM - 60) doc.addPage();
+      doc.font('Helvetica-Bold').fontSize(10).fillColor('#1e3a8a').text(label, LEFT, doc.y);
+      doc.moveDown(0.4);
+    };
+
+    // ── Section 1 ──
+    sectionHeading('SECTION 1: INVOICE INFORMATION');
+    const info: [string, string][] = [
+      ['Invoice Number', String(invoice.invoice_number || '-')],
+      ['Vendor', String(invoice.vendor_name || '-')],
+      ['Vendor GST', String(invoice.gst_number || '-')],
+      ['Invoice Date', invoice.invoice_date ? new Date(invoice.invoice_date).toLocaleDateString() : '-'],
+      ['Status', String(invoice.status || '-')],
+      ['Payment Status', paymentStatus],
+      ['Invoice Amount', money(invoiceAmount)],
+      ['Amount Paid', money(amountPaid)],
+      ['Pending Amount', money(pendingAmount)],
+      ['Reference GRN Sum', money(parseFloat(invoice.reference_amount || '0'))],
+      ['Variance', money(parseFloat(invoice.variance || '0'))],
+      ['Remarks', String(invoice.remarks || '-')]
+    ];
+    doc.fontSize(9);
+    for (const [label, value] of info) {
+      const h = Math.max(doc.heightOfString(value, { width: 340 }), 12) + 4;
+      if (doc.y + h > PAGE_BOTTOM) doc.addPage();
+      const rowY = doc.y;
+      doc.font('Helvetica-Bold').fillColor('#475569').text(label, LEFT, rowY, { width: 150 });
+      doc.font('Helvetica').fillColor('#111827').text(value, LEFT + 155, rowY, { width: 340 });
+      doc.y = rowY + h;
+    }
+    doc.moveDown(1);
+
+    // ── Section 2 ──
+    sectionHeading('SECTION 2: LINKED GOODS RECEIPTS (GRNs)');
+    const grnCols = { no: LEFT, date: 200, project: 290, amount: 440 };
+    const drawGrnHeader = () => {
+      const y = doc.y;
+      doc.rect(LEFT, y - 3, RIGHT - LEFT, 18).fill('#eff6ff');
+      doc.fillColor('#1e3a8a').font('Helvetica-Bold').fontSize(8);
+      doc.text('GRN NUMBER', grnCols.no + 5, y);
+      doc.text('RECEIPT DATE', grnCols.date, y);
+      doc.text('PROJECT', grnCols.project, y);
+      doc.text('AMOUNT', grnCols.amount, y, { width: 100, align: 'right' });
+      doc.y = y + 20;
+    };
+    drawGrnHeader();
+    doc.font('Helvetica').fontSize(9).fillColor('#111827');
+    if (linkedGrns.length === 0) {
+      doc.text('No linked goods receipts.', LEFT + 5, doc.y);
+      doc.y += 16;
+    } else {
+      for (const g of linkedGrns) {
+        const h = Math.max(doc.heightOfString(g.project_name, { width: 140 }), 12) + 8;
+        if (doc.y + h > PAGE_BOTTOM) { doc.addPage(); drawGrnHeader(); doc.font('Helvetica').fontSize(9).fillColor('#111827'); }
+        const y = doc.y;
+        doc.text(g.grn_number || '-', grnCols.no + 5, y, { width: 140 });
+        doc.text(g.grn_date ? new Date(g.grn_date).toLocaleDateString() : '-', grnCols.date, y, { width: 85 });
+        doc.text(g.project_name, grnCols.project, y, { width: 140 });
+        doc.text(money(g.amount), grnCols.amount, y, { width: 100, align: 'right' });
+        doc.y = y + h;
+        doc.moveTo(LEFT, doc.y - 3).lineTo(RIGHT, doc.y - 3).strokeColor('#e5e7eb').stroke();
+      }
+    }
+    doc.moveDown(1);
+
+    // ── Section 3 ──
+    sectionHeading('SECTION 3: INVOICE ITEMS');
+    const itemCols = { name: LEFT, unit: 250, qty: 310, details: 380, amount: 445 };
+
+    /** Column headings for the item table. Called once, then after every page break. */
+    const drawInvoiceItemsHeader = () => {
+      const y = doc.y;
+      doc.rect(LEFT, y - 3, RIGHT - LEFT, 18).fill('#eff6ff');
+      doc.fillColor('#1e3a8a').font('Helvetica-Bold').fontSize(8);
+      doc.text('ITEM NAME', itemCols.name + 5, y, { width: 190 });
+      doc.text('UNIT', itemCols.unit, y, { width: 55 });
+      doc.text('TOTAL QTY', itemCols.qty, y, { width: 65, align: 'right' });
+      doc.text('DETAILS', itemCols.details, y, { width: 60, align: 'center' });
+      doc.text('LINE AMOUNT', itemCols.amount, y, { width: 95, align: 'right' });
+      doc.y = y + 20;
+    };
+
+    drawInvoiceItemsHeader();
+    doc.font('Helvetica').fontSize(9).fillColor('#111827');
+
+    if (groupedItems.length === 0) {
+      doc.text('No items found in linked GRNs.', LEFT + 5, doc.y);
+      doc.y += 16;
+    } else {
+      for (const group of groupedItems) {
+        // Measure the tallest cell so a wrapped item name is never clipped, and break BEFORE
+        // a row that would not fit rather than splitting it.
+        const nameHeight = doc.heightOfString(group.item_name || '-', { width: 190 });
+        const rowHeight = Math.max(nameHeight, 12) + 8;
+
+        if (doc.y + rowHeight > PAGE_BOTTOM) {
+          doc.addPage();
+          drawInvoiceItemsHeader();
+          doc.font('Helvetica').fontSize(9).fillColor('#111827');
+        }
+
+        const y = doc.y;
+        doc.text(group.item_name || '-', itemCols.name + 5, y, { width: 190 });
+        doc.text(group.unit || '-', itemCols.unit, y, { width: 55 });
+        doc.text(String(group.total_quantity), itemCols.qty, y, { width: 65, align: 'right' });
+        doc.text(`${group.receipts} receipt${group.receipts !== 1 ? 's' : ''}`, itemCols.details, y, { width: 60, align: 'center' });
+        doc.text(money(group.amount), itemCols.amount, y, { width: 95, align: 'right' });
+        doc.y = y + rowHeight;
+        doc.moveTo(LEFT, doc.y - 3).lineTo(RIGHT, doc.y - 3).strokeColor('#e5e7eb').stroke();
+      }
+    }
+    doc.moveDown(1);
+
+    // ── Section 4 — always after the final item row ──
+    sectionHeading('SECTION 4: FINANCIAL SUMMARY');
+    const summary: [string, number][] = [
+      ['Material Total (Taxable Items)', materialTotal],
+      ['Discount Deductions', parseFloat(invoice.discount_amount || '0')],
+      ['Transport Charges', parseFloat(invoice.transport_charges || '0')],
+      ['Other Charges', parseFloat(invoice.other_charges || '0')],
+      ['Final Invoice Amount', invoiceAmount],
+      ['Variance', parseFloat(invoice.variance || '0')]
+    ];
+    doc.fontSize(9);
+    for (const [label, value] of summary) {
+      if (doc.y + 18 > PAGE_BOTTOM) doc.addPage();
+      const y = doc.y;
+      const isTotal = label === 'Final Invoice Amount';
+      doc.font(isTotal ? 'Helvetica-Bold' : 'Helvetica').fillColor(isTotal ? '#111827' : '#475569');
+      doc.text(label, LEFT, y, { width: 300 });
+      doc.text(money(value), itemCols.amount - 50, y, { width: 145, align: 'right' });
+      doc.y = y + 16;
+    }
+
+    doc.end();
+  } catch (error: any) {
+    console.error('Vendor Invoice PDF generation error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to generate the Vendor Invoice PDF.' });
+    } else {
+      res.end();
+    }
+  }
+});
+
 api.put('/vendor-invoices/:id', authorizeAction('vendor_invoices', 'edit'), async (req, res) => {
   const { id } = req.params;
   const { invoice_date, remarks, line_items, transport_charges, other_charges, discount_amount } = req.body;

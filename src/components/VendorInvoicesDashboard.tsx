@@ -120,6 +120,7 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
   const [detailedGrns, setDetailedGrns] = useState<any[]>([]);
   const [detailedItems, setDetailedItems] = useState<any[]>([]);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [isDownloadingPDF, setIsDownloadingPDF] = useState(false);
   const [expandedItems, setExpandedItems] = useState<Record<string, boolean>>({});
 
   // Refs
@@ -910,8 +911,50 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
     window.print();
   };
 
-  const handleDownloadPDFPlaceholder = () => {
-    alert("PDF generation & download functionality (Coming Soon in Vendor Invoice Phase 3).");
+  /**
+   * Download the invoice as a PDF.
+   *
+   * Only the id is sent — the server reads every figure itself, so nothing financial travels
+   * from the browser. The filename comes from the response's Content-Disposition rather than
+   * being rebuilt here, so it is defined in exactly one place.
+   */
+  const handleDownloadPDF = async () => {
+    if (!selectedInvoice) return;
+    setIsDownloadingPDF(true);
+    try {
+      const response = await fetch(`${API_CONFIG.BASE_URL}/vendor-invoices/${selectedInvoice.id}/pdf`, {
+        headers: createAuthHeaders()
+      });
+
+      if (!response.ok) {
+        const message =
+          response.status === 401 ? 'Your session has expired. Please sign in again.'
+          : response.status === 403 ? 'You do not have permission to export vendor invoices.'
+          : response.status === 404 ? 'This vendor invoice could not be found.'
+          : 'Unable to generate the Vendor Invoice PDF. Please try again.';
+        showToast(message, 'error');
+        return;
+      }
+
+      const disposition = response.headers.get('content-disposition') || '';
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      const fileName = match ? match[1] : 'invoice.pdf';
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', fileName);
+      document.body.appendChild(link);
+      link.click();
+      link.parentNode?.removeChild(link);
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Vendor Invoice PDF download error:', error);
+      showToast('Unable to generate the Vendor Invoice PDF. Please try again.', 'error');
+    } finally {
+      setIsDownloadingPDF(false);
+    }
   };
 
   return (
@@ -1331,11 +1374,12 @@ export function VendorInvoicesDashboard({ role }: VendorInvoicesDashboardProps) 
                 Print Details
               </button>
               <button 
-                onClick={handleDownloadPDFPlaceholder}
-                className="px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 transition-all flex items-center shadow-lg shadow-blue-100"
+                onClick={handleDownloadPDF}
+                disabled={isDownloadingPDF}
+                className="px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 transition-all flex items-center shadow-lg shadow-blue-100 disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <FileDown className="w-4 h-4 mr-2" />
-                Download PDF
+                {isDownloadingPDF ? 'Preparing...' : 'Download PDF'}
               </button>
               <button 
                 onClick={() => setActiveView('list')}
