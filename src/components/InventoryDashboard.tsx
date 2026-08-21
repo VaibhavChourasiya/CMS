@@ -1122,17 +1122,12 @@ export function InventoryDashboard({ role }: InventoryDashboardProps) {
             <form onSubmit={handleOpeningStockSubmit} className="p-6 space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Inventory Item</label>
-                <select
-                  required
+                <SearchableSelect
+                  options={toMaterialOptions(inventory)}
                   value={osItemId}
-                  onChange={e => setOsItemId(e.target.value)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                >
-                  <option value="">Select Material...</option>
-                  {inventory.map(i => (
-                    <option key={i.id} value={i.id}>{i.item_name} ({i.unit})</option>
-                  ))}
-                </select>
+                  onChange={(val) => setOsItemId(String(val))}
+                  placeholder="Select Material..."
+                />
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
